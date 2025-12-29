@@ -1,0 +1,1123 @@
+# -*- coding: utf-8 -*-
+"""
+Trading bot - Final integrated version (v2.2 - XT & CCXT compatibility fixes)
+- Modes: Backtest | LiveVirtual | LiveReal (xt)
+- Preserves original trading strategy with minimal compatibility fixes.
+"""
+
+import os
+import time
+import json
+import math
+import numpy as np
+import pandas as pd
+import ccxt
+import talib
+from datetime import datetime, timezone, timedelta
+
+# ------------------ Config loading ------------------
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(HERE, 'config.json')
+
+# Default values fallback
+DEFAULT_CONFIG = {
+    "exchange": "xt",
+    "timeframe": "4h",
+    "backtest_days": 30,
+    "fetch_batch_limit": 1000,
+    "equity_start": 1000.0,
+    "allowed_weekdays": [0, 1, 2, 3, 4, 5, 6],
+    "allowed_hours": [0, 4, 8, 12, 16, 20],
+    #"allowed_hours": [12, 16],
+    "atr_period": 14,
+    "sl_atr_mult": 1.8,
+    "tp_atr_mult": 2.8,
+    "breakeven_rr": 1.2,
+    "trail_start_rr": 1.6,
+    "min_atr_pct": 0.35,
+    "vol_lookback": 48,
+    "min_quote_volume_5m": 45000,
+    "max_spread_pct": 0.2,
+    "taker_fee": 0.0010,
+    "slippage_pct": 0.0001,
+    "sleep_offset_sec": 2,
+    "log_dir": "./logs_v2",
+    "risk_time_multipliers": {
+      "0": {"0": 0.0, "4": 0.0, "8": 0.0, "12": 0.0, "16": 0.0, "20": 0.0},
+      "1": {"0": 0.0, "4": 0.0, "8": 0.0, "12": 0.0, "16": 0.0, "20": 0.0},
+      "2": {"0": 1.5, "4": 2.0, "8": 0.0, "12": 2.0, "16": 2.0, "20": 0.0},
+      "3": {"0": 1.5, "4": 2.5, "8": 0.0, "12": 2.0, "16": 2.0, "20": 0.0},
+      "4": {"0": 2.0, "4": 2.5, "8": 0.0, "12": 2.5, "16": 2.0, "20": 0.0},
+      "5": {"0": 1.0, "4": 1.5, "8": 0.0, "12": 1.5, "16": 1.0, "20": 0.0},
+      "6": {"0": 0.0, "4": 0.0, "8": 0.0, "12": 0.0, "16": 0.0, "20": 0.0}
+    },
+    "default_risk_time_multiplier": 1.0,
+    "enable_time_based_risk": True,
+    "enable_partial_tp": True,
+    "partial_tp_rr": 1.0,
+    "partial_tp_pct": 0.9,
+    "trail_atr_mult": 1.0,
+    "risk_per_trade_pct": 1.0,
+    "max_total_risk_pct": 5.0,
+    "symbols_core": ["ADA/USDT", "MANA/USDT", "DASH/USDT", "DOGE/USDT", "CAKE/USDT"],
+    "symbols_extended": [],
+    "trading_enabled": 1,
+    "access_id": "b6d18dea-c0c5-4ef2-baac-6a74347a7136",
+    "secret_key": "e9fe8584c326be1489b19db8328cda46c93dfb21",
+    "real_trading_enabled": 1,
+    "dry_run": 1,
+    "mode": "live_real"
+}
+#Modes: backtest | live_virtual | live_real
+
+def load_config(path=CONFIG_PATH):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+    except Exception as e:
+        print(f"[CONFIG] Could not load {path}: {e} — using DEFAULT_CONFIG.")
+        cfg = {}
+    merged = DEFAULT_CONFIG.copy()
+    merged.update(cfg)
+    return merged
+
+CONFIG = load_config()
+
+# ------------------ Utils ------------------
+def ensure_dirs():
+    os.makedirs(CONFIG.get('log_dir', './logs_v2'), exist_ok=True)
+
+def ts_now(fmt_local=False):
+    if fmt_local:
+        return datetime.now().strftime('%m/%d/%Y %I:%M:%S %p')
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+def log_print(msg: str):
+    print(msg)
+    try:
+        with open(os.path.join(CONFIG.get('log_dir', './logs_v2'), 'terminal.log'), 'a', encoding='utf-8') as f:
+            f.write(f"[{ts_now()}] {msg}\n")
+    except Exception:
+        pass
+
+def timeframe_to_seconds(tf: str) -> int:
+    if tf.endswith('m'):
+        return int(tf[:-1]) * 60
+    if tf.endswith('h'):
+        return int(tf[:-1]) * 3600
+    if tf.endswith('d'):
+        return int(tf[:-1]) * 86400
+    raise ValueError('Unsupported timeframe')
+
+def sleep_until_next_candle(tf_seconds=300, offset=2):
+    now = time.time()
+    wait = tf_seconds - (int(now) % tf_seconds) + offset
+    time.sleep(max(1, wait))
+
+# ------------------ Data Fetch ------------------
+def fetch_ohlcv_long(exchange, symbol, timeframe, days, batch_limit):
+    since = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+    all_rows = []
+    safety_counter = 0
+    step_ms = timeframe_to_seconds(timeframe) * 1000
+
+    while True:
+        max_retries = 3
+        attempt = 0
+        ohlcv = None
+        last_exc = None
+        while attempt < max_retries:
+            try:
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=batch_limit)
+                break
+            except Exception as e:
+                last_exc = e
+                attempt += 1
+                log_print(f"[FETCH] Error {symbol} (Attempt {attempt}/{max_retries}): {e}")
+                if attempt < max_retries:
+                    time.sleep(attempt * 3)
+        
+        if ohlcv is None:
+            log_print(f"[FETCH] Failed to fetch {symbol} after {max_retries} attempts. Error: {last_exc}")
+            break
+
+        if not ohlcv:
+            break
+        all_rows.extend(ohlcv)
+        since = ohlcv[-1][0] + step_ms
+        safety_counter += 1
+        if len(ohlcv) < batch_limit or safety_counter > 500:
+            break
+
+    if not all_rows:
+        return None
+
+    df = pd.DataFrame(all_rows, columns=['timestamp','open','high','low','close','volume'])
+    df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
+    df.sort_values('timestamp', inplace=True)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_convert('UTC')
+    df.set_index('timestamp', inplace=True)
+    for col in ['open','high','low','close','volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df.dropna(subset=['open','high','low','close','volume'], inplace=True)
+    return df
+
+# ------------------ Indicators ------------------
+def calculate_heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
+    ha_close = (df['open'] + df['high'] + df['low'] + df['close']) / 4.0
+    ha_open = [ (df['open'].iloc[0] + df['close'].iloc[0]) / 2.0 ]
+    for i in range(1, len(df)):
+        ha_open.append( (ha_open[i-1] + ha_close.iloc[i-1]) / 2.0 )
+    ha_open = pd.Series(ha_open, index=df.index)
+    ha_high = pd.concat([df['high'], ha_open, ha_close], axis=1).max(axis=1)
+    ha_low  = pd.concat([df['low'],  ha_open, ha_close], axis=1).min(axis=1)
+    df['ha_open'] = ha_open
+    df['ha_high'] = ha_high
+    df['ha_low']  = ha_low
+    df['ha_close']= ha_close
+    return df
+
+def indicators(df: pd.DataFrame, cfg=CONFIG) -> pd.DataFrame:
+    close = df['close'].astype(float)
+    high = df['high'].astype(float)
+    low  = df['low'].astype(float)
+    volume = df['volume'].astype(float)
+
+    df['sma_fast'] = talib.SMA(close, timeperiod=12)
+    df['sma_trend'] = talib.SMA(close, timeperiod=26)
+    macd, macdsig, macdhist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+    df['macd'] = macd
+    df['macdsig'] = macdsig
+    df['macdhist'] = macdhist
+
+    df['atr'] = talib.ATR(high, low, close, timeperiod=cfg.get('atr_period', 14))
+    df['atr_pct'] = (df['atr'] / close.replace(0, np.nan)) * 100.0
+
+    df['resistance'] = high.rolling(20).max().shift(1)
+    df['support']    = low.rolling(20).min().shift(1)
+
+    df['avg_volume'] = volume.rolling(10).mean().shift(1)
+    df['quote_volume'] = df['close'] * df['volume']
+    df['quote_vol_ma'] = df['quote_volume'].rolling(cfg.get('vol_lookback', 48)).median()
+
+    return df
+
+# ------------------ Signals & Risk ------------------
+def generate_signal_row(df: pd.DataFrame, idx: int, cfg=CONFIG) -> dict:
+    if idx < 3:
+        return {'buy': False, 'reason': None}
+
+    row = df.iloc[idx]
+    prev = df.iloc[idx-1]
+
+    vol_filter = (row['atr_pct'] > cfg.get('min_atr_pct', 0.35))
+    vol_rel = (row['volume'] > (row['avg_volume'] * 1.2))
+    trend_filter = (row['close'] > row['sma_trend'])
+    macd_up = (row['macdhist'] > 0) and (row['macdhist'] > prev['macdhist'])
+    ha_trend_ok = (row['ha_close'] > row['ha_open'])
+
+    main = macd_up and trend_filter and ha_trend_ok and vol_filter and vol_rel
+    breakout = (row['close'] > row['resistance']) and vol_rel
+    reversal = (row['close'] > row['support']) and (row['close'] < row['support'] * 1.01) and (row['macdhist'] > 0) and vol_rel
+
+    buy = bool(main or breakout or reversal)
+    reason = 'main' if main else ('breakout' if breakout else ('reversal' if reversal else None))
+    return {'buy': buy, 'reason': reason}
+
+def calc_sl_tp_from_atr(entry_price: float, atr: float, cfg=CONFIG):
+    atr_val = atr if (atr is not None and atr > 0) else entry_price * 0.01
+    sl = entry_price - cfg.get('sl_atr_mult', 1.8) * atr_val
+    tp = entry_price + cfg.get('tp_atr_mult', 2.8) * atr_val
+    return sl, tp
+
+def position_size(equity: float, entry: float, sl: float, cfg=CONFIG) -> float:
+    risk_amount = equity * (cfg.get('risk_per_trade_pct', 1.0) / 100.0)
+    per_unit_risk = max(entry - sl, 1e-9)
+    qty = risk_amount / per_unit_risk
+    return max(qty, 0.0)
+
+def apply_fees_and_slippage(entry: float, exit_price: float, cfg=CONFIG):
+    e = entry * (1 + cfg.get('slippage_pct', 0.0002))
+    x = exit_price * (1 - cfg.get('slippage_pct', 0.0002))
+    gross_pct = (x - e) / e * 100.0
+    fees_pct = (cfg.get('taker_fee', 0.0010) + cfg.get('taker_fee', 0.0010)) * 100.0
+    net_pct = gross_pct - fees_pct
+    return net_pct
+
+# ------------------ Backtester ------------------
+class Backtester:
+    def __init__(self, exchange, symbols, cfg=CONFIG):
+        self.exchange = exchange
+        self.symbols = symbols
+        self.cfg = cfg
+        self.equity = cfg.get('equity_start', 1000.0)
+        self.trades = []
+        self.open_positions = {}
+        self.equity_curve = []
+        self.dfs = {}
+        self.index_pos_map = {}
+        self.master_timestamps = []
+
+    def fetch_ohlcv_df(self, symbol):
+        try:
+            df = fetch_ohlcv_long(
+                self.exchange, symbol, self.cfg.get('timeframe', '4h'),
+                self.cfg.get('backtest_days', 360), self.cfg.get('fetch_batch_limit', 1000)
+            )
+        except Exception as e:
+            log_print(f"[BT] Fetch error {symbol}: {e}")
+            return None
+
+        if df is None or df.empty:
+            log_print(f"[BT] Empty data {symbol}")
+            return None
+
+        df = calculate_heikin_ashi(df)
+        df = indicators(df, self.cfg)
+        return df
+
+    def prepare_data(self):
+        self.dfs = {}
+        self.index_pos_map = {}
+
+        for sym in self.symbols:
+            df = self.fetch_ohlcv_df(sym)
+            if df is None or len(df) < 100:
+                log_print(f"[BT] Skip {sym}: insufficient data")
+                continue
+
+            recent_qv = df['quote_vol_ma'].dropna().tail(50)
+            if recent_qv.empty or recent_qv.median() < self.cfg.get('min_quote_volume_5m', 30000):
+                log_print(f"[BT] Skip {sym} due to low 5m quote volume")
+                continue
+
+            self.dfs[sym] = df
+            self.index_pos_map[sym] = {ts: i for i, ts in enumerate(df.index)}
+
+        if not self.dfs:
+            log_print("[BT] No symbols to run after filtering")
+            return False
+
+        all_ts = set()
+        for df in self.dfs.values():
+            all_ts.update(df.index)
+        self.master_timestamps = sorted(all_ts)
+
+        log_print(f"[BT] Prepared {len(self.dfs)} symbols. Master timeline length: {len(self.master_timestamps)}")
+        return True
+
+    def get_time_multiplier(self, entry_time):
+        if not self.cfg.get('enable_time_based_risk', True):
+            return 1.0
+        default = float(self.cfg.get('default_risk_time_multiplier', 1.0))
+        mapping = self.cfg.get('risk_time_multipliers', {})
+        wd = entry_time.weekday()
+        h = entry_time.hour
+        wd_map = mapping.get(wd) if isinstance(mapping.get(wd), dict) else mapping.get(str(wd))
+        if wd_map is None:
+            wd_map = mapping.get(str(wd), None)
+        if wd_map is None:
+            return default
+        return float(wd_map.get(h, wd_map.get(str(h), default)))
+
+    def _record_trade(self, symbol, entry_time, entry_price, exit_time, exit_price, reason, qty, net_pct):
+        if hasattr(entry_time, "strftime"):
+            et = entry_time.strftime('%m/%d/%Y %I:%M:%S %p')
+        else:
+            et = str(entry_time)
+        if hasattr(exit_time, "strftime"):
+            xt = exit_time.strftime('%m/%d/%Y %I:%M:%S %p')
+        else:
+            xt = str(exit_time)
+        try:
+            net_pct_val = float(net_pct)
+        except Exception:
+            net_pct_val = 0.0
+        net_usd = qty * entry_price * (net_pct_val / 100.0)
+        try:
+            self.equity += net_usd
+        except Exception:
+            pass
+        
+        final_reason = reason
+        if reason == 'SL':
+            if exit_price > entry_price:
+                final_reason = 'Trail_SL'
+            elif exit_price == entry_price:
+                final_reason = 'BE_SL'
+
+        self.trades.append({
+            'symbol': symbol,
+            'entry_time': et,
+            'entry': float(entry_price),
+            'exit_time': xt,
+            'exit': float(exit_price),
+            'reason': final_reason,
+            'qty': float(qty),
+            'net_pct': float(net_pct_val),
+            'net_usd': float(net_usd),
+            'equity': float(self.equity)
+        })
+        
+        log_print(f"[EXIT] {symbol} {final_reason} | entry {entry_price:.6f} exit {exit_price:.6f} qty {qty:.6f} net% {net_pct_val:.2f} PnL ${net_usd:.2f} eq {self.equity:.2f}")
+
+    def _exit_position(self, symbol, pos, exit_price, exit_time, exit_reason, exit_qty=None):
+        rem_qty = float(pos.get('qty', 0.0))
+        if exit_qty is None or exit_qty >= rem_qty:
+            close_qty = rem_qty
+        else:
+            close_qty = float(exit_qty)
+
+        if close_qty <= 0:
+            return
+
+        try:
+            net_pct = apply_fees_and_slippage(pos['entry'], exit_price, self.cfg)
+            pnl_usd = close_qty * pos['entry'] * (net_pct / 100.0)
+        except Exception as e:
+            log_print(f"[BT] _exit_position calc error {symbol}: {e}")
+            net_pct = 0.0
+            pnl_usd = 0.0
+
+        self._record_trade(
+            symbol=symbol,
+            entry_time=pos['entry_time'],
+            entry_price=pos['entry'],
+            exit_time=exit_time,
+            exit_price=exit_price,
+            reason=exit_reason,
+            qty=close_qty,
+            net_pct=net_pct
+        )
+
+        pos['qty'] = max(rem_qty - close_qty, 0.0)
+        if pos['qty'] <= 1e-12:
+            if symbol in self.open_positions:
+                del self.open_positions[symbol]
+
+    def run(self):
+        if not self.prepare_data():
+            return
+
+        cfg = self.cfg
+        dfs = self.dfs
+        index_map = self.index_pos_map
+
+        for ts in self.master_timestamps:
+            for symbol, pos in list(self.open_positions.items()):
+                if symbol not in dfs: continue
+                df = dfs[symbol]
+                if ts not in index_map[symbol]: continue
+
+                i_pos = index_map[symbol][ts]
+                row = df.iloc[i_pos]
+                nxt = df.iloc[i_pos + 1] if (i_pos + 1) < len(df) else None
+
+                rr_denom = (pos['entry'] - pos['sl_init'])
+                rr_now = (row['close'] - pos['entry']) / rr_denom if rr_denom > 0 else 0.0
+
+                if rr_now >= cfg.get('breakeven_rr', 1.0) and pos.get('sl', pos['sl_init']) < pos['entry']:
+                    pos['sl'] = pos['entry']
+
+                if rr_now >= cfg.get('trail_start_rr', 9999):
+                    trail_sl = row['close'] - cfg.get('trail_atr_mult', 1.0) * row['atr']
+                    pos['sl'] = max(pos.get('sl', pos['sl_init']), trail_sl)
+
+                if nxt is None: continue
+
+                rr_denom = (pos['entry'] - pos['sl_init']) if (pos['entry'] - pos['sl_init']) > 0 else 1e-9
+                partial_price = None
+                if cfg.get('enable_partial_tp', True):
+                    partial_rr = float(cfg.get('partial_tp_rr', 1.2))
+                    partial_price = pos['entry'] + partial_rr * rr_denom
+                tp_price = float(pos['tp'])
+                sl_price = float(pos.get('sl', pos['sl_init']))
+
+                if nxt['low'] <= sl_price:
+                    self._exit_position(symbol, pos, sl_price, nxt.name, 'SL')
+                    continue
+
+                if nxt['high'] >= tp_price:
+                    self._exit_position(symbol, pos, tp_price, nxt.name, 'TP')
+                    continue
+                
+                if (partial_price is not None and 
+                    nxt['high'] >= partial_price and 
+                    not pos.get('partial_tp_taken', False)): 
+                    
+                    part_pct = float(cfg.get('partial_tp_pct', 0.5))
+                    part_qty = pos['qty'] * part_pct
+                    
+                    if part_qty > 0:
+                        self._exit_position(symbol, pos, partial_price, nxt.name, 'TP_partial', exit_qty=part_qty)
+                        pos['sl'] = max(pos.get('sl', pos['sl_init']), pos['entry'])
+                        pos['partial_tp_taken'] = True
+                        continue
+
+            entry_candidates = []
+            for symbol, df in dfs.items():
+                if symbol in self.open_positions or ts not in index_map[symbol]: continue
+                i_pos = index_map[symbol][ts]
+                sig = generate_signal_row(df, i_pos, cfg)
+                row = df.iloc[i_pos]
+                if not sig['buy']: continue
+                if not (row['atr_pct'] > cfg.get('min_atr_pct', 0.35)): continue
+                if not (row['volume'] > row['avg_volume'] * 1.2): continue
+
+                nxt = df.iloc[i_pos + 1] if (i_pos + 1) < len(df) else None
+                entry_price = float(nxt['open']) if nxt is not None else float(row['close'])
+                sl, tp = calc_sl_tp_from_atr(entry_price, float(row['atr']), cfg)
+                entry_time = (nxt.name if nxt is not None else df.index[i_pos])
+
+                weekday = entry_time.weekday()
+                hour = entry_time.hour
+                if self.cfg.get('allowed_weekdays') and weekday not in self.cfg.get('allowed_weekdays'): continue
+                if self.cfg.get('allowed_hours') and hour not in self.cfg.get('allowed_hours'): continue
+
+                entry_candidates.append({
+                    'symbol': symbol,
+                    'entry': entry_price,
+                    'sl': float(sl),
+                    'sl_init': float(sl),
+                    'tp': float(tp),
+                    'entry_time': entry_time,
+                    'reason': sig['reason']
+                })
+
+            pre_entry_equity = self.equity
+            active_risk_usd = 0.0
+            for pos in self.open_positions.values():
+                per_unit_risk = max(pos['entry'] - pos['sl_init'], 1e-9)
+                active_risk_usd += pos['qty'] * per_unit_risk
+            active_risk_pct = (active_risk_usd / pre_entry_equity) * 100.0 if pre_entry_equity > 0 else 0.0
+            free_risk_pct = max(cfg.get('max_total_risk_pct', 4.0) - active_risk_pct, 0.0)
+
+            if not cfg.get('trading_enabled', 1):
+                if entry_candidates:
+                    log_print('[BT] Trading disabled (trading_enabled=0) — skipping new entries.')
+            else:
+                for cand in entry_candidates:
+                    if free_risk_pct <= 0.0: break
+
+                    per_unit_risk = max(cand['entry'] - cand['sl'], 1e-9)
+                    base_risk_pct = float(cfg.get('risk_per_trade_pct', 1.0))
+                    time_mult = float(self.get_time_multiplier(cand['entry_time']))
+                    adj_risk_pct = base_risk_pct * time_mult
+
+                    theoretical_risk_usd = pre_entry_equity * (adj_risk_pct / 100.0)
+                    theoretical_qty = theoretical_risk_usd / per_unit_risk
+                    theoretical_risk_pct = (theoretical_qty * per_unit_risk / pre_entry_equity) * 100.0 if pre_entry_equity>0 else 0.0
+
+                    allowed_risk_pct = min(theoretical_risk_pct, free_risk_pct)
+                    allowed_risk_usd = (allowed_risk_pct / 100.0) * pre_entry_equity
+                    qty = allowed_risk_usd / per_unit_risk if per_unit_risk > 0 else 0.0
+
+                    if qty > 0:
+                        sym = cand['symbol']
+                        entry_time_str = cand['entry_time'].strftime('%m/%d/%Y %I:%M:%S %p') if hasattr(cand['entry_time'], "strftime") else str(cand['entry_time'])
+                        self.open_positions[sym] = {
+                            'symbol': sym,
+                            'entry_time': entry_time_str,
+                            'entry': float(cand['entry']),
+                            'sl': float(cand['sl']),
+                            'sl_init': float(cand['sl_init']),
+                            'tp': float(cand['tp']),
+                            'qty': float(qty),
+                            'reason': cand['reason'],
+                            'time_multiplier': time_mult,
+                            'initial_qty': float(qty)
+                        }
+                        free_risk_pct -= allowed_risk_pct
+                        log_print(f"[ENTRY] {sym} {cand['reason']} | entry {cand['entry']:.6f} sl {cand['sl']:.6f} tp {cand['tp']:.6f} qty {qty:.6f} risk% {allowed_risk_pct:.2f} time_mult {time_mult:.2f}")
+
+            self.equity_curve.append({
+                'time': ts.strftime('%Y-%m-%d %H:%M:%S'),
+                'equity': float(self.equity)
+            })
+
+        for symbol, pos in list(self.open_positions.items()):
+            df = self.dfs.get(symbol)
+            if df is None or len(df) == 0: continue
+            last_price = float(df['close'].iloc[-1])
+            last_time = df.index[-1]
+            self._exit_position(symbol, pos, last_price, last_time, exit_reason='EoD')
+
+        log_print('[BT] Backtest run finished.')
+
+    def export_logs(self):
+        os.makedirs(self.cfg.get('log_dir', CONFIG.get('log_dir')), exist_ok=True)
+        ts_now_str = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')
+        trades_path = os.path.join(self.cfg['log_dir'], f"trades_{ts_now_str}.csv")
+        eq_path = os.path.join(self.cfg['log_dir'], f"equity_curve_{ts_now_str}.csv")
+        summary_path = os.path.join(self.cfg['log_dir'], f"summary_{ts_now_str}.csv")
+
+        pd.DataFrame(self.trades).to_csv(trades_path, index=False)
+        pd.DataFrame(self.equity_curve).to_csv(eq_path, index=False)
+
+        if self.trades:
+            df_t = pd.DataFrame(self.trades)
+            win = (df_t['net_pct'] > 0).sum()
+            loss = (df_t['net_pct'] <= 0).sum()
+            wr = (win / len(df_t)) * 100 if len(df_t)>0 else 0.0
+            pf = (df_t.loc[df_t['net_pct'] > 0, 'net_pct'].sum() /
+                  abs(df_t.loc[df_t['net_pct'] <= 0, 'net_pct'].sum())
+                  ) if loss > 0 else np.inf
+
+            peak = -1e9
+            max_dd = 0.0
+            max_dd_abs = 0.0
+            for row in self.equity_curve:
+                eq = row['equity']
+                if eq > peak: peak = eq
+                dd = (eq - peak) / peak * 100.0
+                dd_abs = peak - eq
+                if dd < max_dd: max_dd = dd
+                if dd_abs > max_dd_abs: max_dd_abs = dd_abs
+
+            log_print(f"[BT] Trades: {len(df_t)} | Win%: {wr:.1f} | PF: {pf:.2f} | Final Equity: {self.equity:.2f} | MaxDD%: {max_dd:.2f} | MaxDD$: {max_dd_abs:.2f}")
+
+            df_t['entry_time'] = pd.to_datetime(df_t['entry_time'])
+            df_t['weekday'] = df_t['entry_time'].dt.weekday
+            df_t['hour'] = df_t['entry_time'].dt.hour
+
+            def agg_perf(g):
+                wins = (g['net_pct'] > 0).sum()
+                losses = (g['net_pct'] <= 0).sum()
+                wr_local = wins / len(g) * 100 if len(g)>0 else 0.0
+                pf_local = g.loc[g['net_pct'] > 0, 'net_pct'].sum() / abs(g.loc[g['net_pct'] <= 0, 'net_pct'].sum()) if losses>0 else np.inf
+                total_net = g['net_pct'].sum()
+                return pd.Series({'trades':len(g), 'win_rate%':wr_local, 'profit_factor':pf_local, 'total_net%':total_net})
+
+            by_day = df_t.groupby('weekday', group_keys=False, sort=False).apply(agg_perf, include_groups=False)
+            by_hour = df_t.groupby('hour', group_keys=False, sort=False).apply(agg_perf, include_groups=False)
+
+            log_print("\n[BT] Performance by Weekday:")
+            log_print(by_day.to_string())
+            log_print("\n[BT] Performance by Hour:")
+            log_print(by_hour.to_string())
+
+
+
+def generate_summary(trades_path, equity_curve_path, equity_start, equity_end, timeframe, out_path):
+    """
+    Generate a simple summary CSV from trades and equity curve.
+    Works even if some files are empty.
+    """
+    import pandas as pd
+    import numpy as np
+
+    try:
+        df_t = pd.read_csv(trades_path)
+    except:
+        df_t = pd.DataFrame()
+
+    try:
+        df_e = pd.read_csv(equity_curve_path)
+    except:
+        df_e = pd.DataFrame()
+
+    summary = {}
+
+    # ----- Trade stats -----
+    summary['total_trades'] = len(df_t)
+
+    if len(df_t) > 0:
+        wins = (df_t['net_pct'] > 0).sum()
+        summary['win_rate_%'] = (wins / len(df_t)) * 100
+        summary['best_trade_%'] = df_t['net_pct'].max()
+        summary['worst_trade_%'] = df_t['net_pct'].min()
+
+        gross_profit = df_t[df_t['net_pct'] > 0]['net_pct'].sum()
+        gross_loss = df_t[df_t['net_pct'] <= 0]['net_pct'].sum()
+        summary['profit_factor'] = (gross_profit / abs(gross_loss)) if gross_loss < 0 else 0
+    else:
+        summary['win_rate_%'] = 0
+        summary['best_trade_%'] = 0
+        summary['worst_trade_%'] = 0
+        summary['profit_factor'] = 0
+
+    # ----- Equity stats -----
+    summary['start_equity'] = equity_start
+    summary['final_equity'] = equity_end
+    summary['net_return_%'] = ((equity_end - equity_start) / equity_start) * 100 if equity_start > 0 else 0
+
+    if len(df_e) > 1 and 'equity' in df_e.columns:
+        eq = df_e['equity']
+        peak = eq.cummax()
+        drawdown = (eq - peak) / peak
+        summary['max_drawdown_%'] = drawdown.min() * 100
+
+        df_e['returns'] = eq.pct_change()
+        if df_e['returns'].std() > 0:
+            summary['sharpe_ratio'] = (df_e['returns'].mean() / df_e['returns'].std()) * np.sqrt(252)
+        else:
+            summary['sharpe_ratio'] = 0
+    else:
+        summary['max_drawdown_%'] = 0
+        summary['sharpe_ratio'] = 0
+
+    # ---- Save summary ----
+    pd.DataFrame([summary]).to_csv(out_path, index=False)
+
+        
+# ------------------ Live Virtual ------------------
+class LiveVirtual:
+    def __init__(self, exchange, symbols, cfg=CONFIG):
+        self.exchange = exchange
+        self.symbols = symbols
+        self.cfg = cfg
+        self.open_positions = {}
+        self.equity = cfg.get('equity_start', 1000.0)
+        self.log_path = os.path.join(cfg.get('log_dir'), 'live_trades.csv')
+        self.last_status_log_time = datetime.now(timezone.utc)
+        self.last_trade_time = None
+
+    def fetch_df(self, symbol, limit=1000):
+        try:
+            df = fetch_ohlcv_long(
+                self.exchange, symbol, self.cfg.get('timeframe', '4h'),
+                days=30,
+                batch_limit=limit
+            )
+        except Exception as e:
+            log_print(f"[LIVE] Fetch error {symbol}: {e}")
+            return None
+        
+        if df is None or df.empty:
+            return None
+        df = calculate_heikin_ashi(df) 
+        df = indicators(df, self.cfg)
+        return df
+
+    def ticker_spread_ok(self, symbol):
+        try:
+            t = self.exchange.fetch_ticker(symbol)
+            bid = t.get('bid')
+            ask = t.get('ask')
+            if not bid or not ask:
+                return False
+            mid = (bid + ask) / 2.0
+            spread_pct = ((ask - bid) / mid) * 100.0
+            return spread_pct <= self.cfg.get('max_spread_pct', 0.2)
+        except Exception:
+            return False
+
+    def log_trade(self, trade: dict):
+        ensure_dirs()
+        path = self.log_path
+        df = pd.DataFrame([trade])
+        if not os.path.exists(path):
+            df.to_csv(path, index=False)
+        else:
+            df.to_csv(path, mode='a', header=False, index=False)
+
+    def _check_status_logging(self):
+        now = datetime.now(timezone.utc)
+        time_since_last_status = (now - self.last_status_log_time).total_seconds()
+        
+        if (self.last_trade_time is None or (now - self.last_trade_time).total_seconds() >= 6 * 3600):
+            if time_since_last_status >= 6 * 3600:
+                log_print(f"[STATUS] No entry signal triggered in last 6h — system running normally. ({ts_now()})")
+                self.last_status_log_time = now
+
+    def run_loop(self):
+        tf_sec = timeframe_to_seconds(self.cfg.get('timeframe', '4h'))
+        log_print(f"=== Live Virtual Started ({ts_now()}) ===")
+        while True:
+            try:
+                self._check_status_logging()
+
+                for symbol in self.symbols:
+                    df = self.fetch_df(symbol)
+                    if df is None or len(df) < 3: continue
+
+                    recent_qv = df['quote_vol_ma'].dropna().tail(50)
+                    if recent_qv.empty or recent_qv.median() < self.cfg.get('min_quote_volume_5m', 30000): continue
+                    if not self.ticker_spread_ok(symbol): continue
+
+                    i = len(df) - 2
+                    row = df.iloc[i]
+                    latest_candle = df.iloc[-1]
+
+                    if symbol in self.open_positions:
+                        pos = self.open_positions[symbol]
+                        
+                        current_price = latest_candle['close']
+                        current_high = latest_candle['high']
+                        current_low = latest_candle['low']
+                        
+                        rr_denom = (pos['entry'] - pos['sl_init'])
+                        rr_now = (current_price - pos['entry']) / rr_denom if rr_denom > 0 else 0.0
+
+                        if rr_now >= self.cfg.get('breakeven_rr') and pos.get('sl', pos['sl_init']) < pos['entry']:
+                            pos['sl'] = pos['entry']
+                        if rr_now >= self.cfg.get('trail_start_rr'):
+                            trail_sl = current_price - self.cfg.get('trail_atr_mult', 1.0) * row['atr']
+                            pos['sl'] = max(pos.get('sl', pos['sl_init']), trail_sl)
+
+                        exit_reason = None
+                        exit_price = None
+                        if current_low <= pos['sl']:
+                            exit_reason = 'SL'
+                            exit_price = pos['sl']
+                        elif current_high >= pos['tp']:
+                            exit_reason = 'TP'
+                            exit_price = pos['tp']
+                        
+                        if (not exit_reason and 
+                            self.cfg.get('enable_partial_tp', True) and 
+                            not pos.get('partial_tp_taken', False)):
+                            
+                            partial_rr = float(self.cfg.get('partial_tp_rr', 1.2))
+                            partial_price = pos['entry'] + partial_rr * (pos['entry'] - pos['sl_init'])
+                            
+                            if current_high >= partial_price:
+                                part_pct = float(self.cfg.get('partial_tp_pct', 0.5))
+                                part_qty = pos['qty'] * part_pct
+                                if part_qty > 0:
+                                    net_pct_part = apply_fees_and_slippage(pos['entry'], partial_price, self.cfg)
+                                    pnl_usd_part = part_qty * pos['entry'] * (net_pct_part / 100.0)
+                                    self.equity += pnl_usd_part
+                                    
+                                    log_print(f"[EXIT] {symbol} TP_partial | entry {pos['entry']:.4f} exit {partial_price:.4f} net% {net_pct_part:.2f} eq {self.equity:.2f}")
+                                    self.log_trade({
+                                        'symbol': symbol,
+                                        'entry_time': pos['entry_time'],
+                                        'entry': float(pos['entry']),
+                                        'exit_time': latest_candle.name.strftime('%m/%d/%Y %I:%M:%S %p'),
+                                        'exit': float(partial_price),
+                                        'reason': 'TP_partial',
+                                        'qty': float(part_qty),
+                                        'net_pct': float(net_pct_part),
+                                        'net_usd': float(pnl_usd_part),
+                                        'equity': float(self.equity)
+                                    })
+                                    pos['qty'] = max(pos['qty'] - part_qty, 0.0)
+                                    pos['sl'] = max(pos.get('sl', pos['sl_init']), pos['entry'])
+                                    pos['partial_tp_taken'] = True
+                                    self.last_trade_time = datetime.now(timezone.utc)
+
+                        if exit_reason:
+                            net_pct = apply_fees_and_slippage(pos['entry'], exit_price, self.cfg)
+                            pnl_usd = pos['qty'] * pos['entry'] * (net_pct / 100.0)
+                            self.equity += pnl_usd
+                            
+                            final_reason = exit_reason
+                            if exit_reason == 'SL':
+                                if exit_price > pos['entry']: final_reason = 'Trail_SL'
+                                elif exit_price == pos['entry']: final_reason = 'BE_SL'
+                                
+                            log_print(f"[EXIT] {symbol} {final_reason} | entry {pos['entry']:.4f} exit {exit_price:.4f} net% {net_pct:.2f} eq {self.equity:.2f}")
+                            self.log_trade({
+                                'symbol': symbol,
+                                'entry_time': pos['entry_time'],
+                                'entry': float(pos['entry']),
+                                'exit_time': latest_candle.name.strftime('%m/%d/%Y %I:%M:%S %p'),
+                                'exit': float(exit_price),
+                                'reason': final_reason,
+                                'qty': float(pos['qty']),
+                                'net_pct': float(net_pct),
+                                'net_usd': float(pnl_usd),
+                                'equity': float(self.equity)
+                            })
+                            del self.open_positions[symbol]
+                            self.last_trade_time = datetime.now(timezone.utc)
+
+                    if symbol not in self.open_positions:
+                        sig = generate_signal_row(df, i, self.cfg)
+                        if sig['buy'] \
+                           and (row['atr_pct'] > self.cfg.get('min_atr_pct', 0.35)) \
+                           and (row['volume'] > row['avg_volume'] * 1.2):
+                            
+                            entry = float(latest_candle['open']) 
+                            sl, tp = calc_sl_tp_from_atr(entry, float(row['atr']), self.cfg)
+                            qty = position_size(self.equity, entry, sl, self.cfg)
+
+                            if qty > 0 and self.cfg.get('trading_enabled', 1):
+                                self.open_positions[symbol] = {
+                                    'symbol': symbol,
+                                    'entry_time': latest_candle.name.strftime('%m/%d/%Y %I:%M:%S %p'),
+                                    'entry': entry,
+                                    'sl': float(sl),
+                                    'sl_init': float(sl),
+                                    'tp': float(tp),
+                                    'qty': float(qty),
+                                    'reason': sig['reason'],
+                                }
+                                log_print(f"[ENTRY] {symbol} {sig['reason']} | entry {entry:.4f} at {self.open_positions[symbol]['entry_time']} sl {sl:.4f} tp {tp:.4f} qty {qty:.6f}")
+                                self.last_trade_time = datetime.now(timezone.utc)
+                            elif not self.cfg.get('trading_enabled', 1):
+                                log_print(f"[LIVE] Trading disabled (trading_enabled=0) — not opening {symbol}.")
+
+                sleep_until_next_candle(tf_seconds=tf_sec, offset=self.cfg.get('sleep_offset_sec', 2))
+
+            except Exception as e:
+                log_print(f"[LIVE ERROR] {e}")
+                time.sleep(5)
+
+# ================== Live Real (XT - Fully Safe Rewrite) ==================
+class LiveReal(LiveVirtual):
+    def __init__(self, exchange, symbols, cfg=CONFIG):
+        super().__init__(exchange, symbols, cfg)
+
+        self.state_path = os.path.join(cfg.get('log_dir'), 'open_positions.json')
+        ensure_dirs()
+        self._load_state()
+
+    # ------------------------------------------------------------------
+    # ---------------------- Persistence Layer --------------------------
+    # ------------------------------------------------------------------
+    def _save_state(self):
+        try:
+            with open(self.state_path, 'w', encoding='utf-8') as f:
+                json.dump(self.open_positions, f, indent=2)
+        except Exception as e:
+            log_print(f"[STATE ERROR] save failed: {e}")
+
+    def _load_state(self):
+        if not os.path.exists(self.state_path):
+            self.open_positions = {}
+            return
+        try:
+            with open(self.state_path, 'r', encoding='utf-8') as f:
+                self.open_positions = json.load(f)
+            log_print(f"[STATE] Restored {len(self.open_positions)} open positions.")
+        except Exception as e:
+            log_print(f"[STATE ERROR] load failed: {e}")
+            self.open_positions = {}
+
+    def _clear_position(self, symbol):
+        if symbol in self.open_positions:
+            del self.open_positions[symbol]
+            self._save_state()
+
+    # ------------------------------------------------------------------
+    # --------------------- Exchange Helpers ----------------------------
+    # ------------------------------------------------------------------
+    def _get_current_price(self, symbol, side='buy'):
+        try:
+            t = self.exchange.fetch_ticker(symbol)
+            if side == 'buy':
+                return float(t.get('ask') or t.get('last'))
+            return float(t.get('bid') or t.get('last'))
+        except Exception:
+            return None
+
+    def _market_info(self, symbol):
+        markets = self.exchange.load_markets()
+        m = markets.get(symbol, {})
+        prec_amount = m.get('precision', {}).get('amount', 8)
+        min_amount = m.get('limits', {}).get('amount', {}).get('min')
+        min_cost = m.get('limits', {}).get('cost', {}).get('min')
+        return prec_amount, min_amount, min_cost
+
+    def _round_amount(self, value, precision):
+        factor = 10 ** int(precision)
+        return math.floor(float(value) * factor) / factor
+
+    # ------------------------------------------------------------------
+    # --------------------- Order Execution -----------------------------
+    # ------------------------------------------------------------------
+    def _safe_market_buy(self, symbol, cost):
+        if not self.cfg.get('real_trading_enabled', 0):
+            price = self._get_current_price(symbol, 'buy')
+            return {'filled': cost / price, 'average': price}
+
+        try:
+            return self.exchange.createMarketBuyOrderWithCost(symbol, cost)
+        except Exception as e:
+            log_print(f"[BUY FAILED] {symbol} cost={cost:.4f} | {e}")
+            return None
+
+    def _safe_market_sell(self, symbol, qty):
+        if not self.cfg.get('real_trading_enabled', 0):
+            price = self._get_current_price(symbol, 'sell')
+            return {'filled': qty, 'average': price}
+
+        try:
+            return self.exchange.create_market_sell_order(symbol, qty)
+        except Exception as e:
+            log_print(f"[SELL FAILED] {symbol} qty={qty:.6f} | {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # --------------------------- Main Loop -----------------------------
+    # ------------------------------------------------------------------
+    def run_loop(self):
+        tf_sec = timeframe_to_seconds(self.cfg.get('timeframe', '4h'))
+        log_print(f"=== Live Real (XT Safe) Started {ts_now()} ===")
+
+        while True:
+            try:
+                self._check_status_logging()
+
+                for symbol in self.symbols:
+                    df = self.fetch_df(symbol)
+                    if df is None or len(df) < 5:
+                        continue
+
+                    i = len(df) - 2
+                    row = df.iloc[i]
+
+                    # ================= ENTRY =================
+                    if symbol not in self.open_positions:
+                        sig = generate_signal_row(df, i, self.cfg)
+                        if not sig['buy']:
+                            continue
+
+                        entry_price = float(row['close'])
+                        sl, tp = calc_sl_tp_from_atr(entry_price, row['atr'], self.cfg)
+                        qty = position_size(self.equity, entry_price, sl, self.cfg)
+                        if qty <= 0:
+                            continue
+
+                        prec_amount, min_amount, min_cost = self._market_info(symbol)
+                        price = self._get_current_price(symbol, 'buy')
+                        if not price:
+                            continue
+
+                        qty = self._round_amount(qty, prec_amount)
+                        cost = float(qty * price)
+
+                        if min_amount and qty < min_amount:
+                            continue
+                        if min_cost and cost < min_cost:
+                            continue
+
+                        order = self._safe_market_buy(symbol, cost)
+                        if not order:
+                            continue  # ⛔ skip this candle – no retry loop
+
+                        avg_price = float(order.get('average') or price)
+                        filled_qty = float(order.get('filled', qty))
+
+                        sl, tp = calc_sl_tp_from_atr(avg_price, row['atr'], self.cfg)
+
+                        self.open_positions[symbol] = {
+                            'symbol': symbol,
+                            'entry': avg_price,
+                            'sl': sl,
+                            'sl_init': sl,
+                            'tp': tp,
+                            'qty': filled_qty,
+                            'entry_time': ts_now(fmt_local=True)
+                        }
+                        self._save_state()
+                        log_print(f"[ENTRY] {symbol} @ {avg_price:.6f} qty {filled_qty:.6f}")
+
+                    # ================= EXIT =================
+                    if symbol in self.open_positions:
+                        pos = self.open_positions[symbol]
+                        last = df.iloc[-1]
+
+                        if last['low'] <= pos['sl']:
+                            exit_price = pos['sl']
+                            reason = 'SL'
+                        elif last['high'] >= pos['tp']:
+                            exit_price = pos['tp']
+                            reason = 'TP'
+                        else:
+                            continue
+
+                        order = self._safe_market_sell(symbol, pos['qty'])
+                        if not order:
+                            continue
+
+                        exec_price = float(order.get('average') or exit_price)
+                        net_pct = apply_fees_and_slippage(pos['entry'], exec_price, self.cfg)
+                        pnl = pos['qty'] * pos['entry'] * (net_pct / 100.0)
+                        self.equity += pnl
+
+                        log_print(f"[EXIT] {symbol} {reason} pnl {pnl:.2f} eq {self.equity:.2f}")
+                        self.log_trade({
+                            'symbol': symbol,
+                            'entry': pos['entry'],
+                            'exit': exec_price,
+                            'reason': reason,
+                            'qty': pos['qty'],
+                            'net_pct': net_pct,
+                            'net_usd': pnl,
+                            'equity': self.equity
+                        })
+
+                        self._clear_position(symbol)
+
+                time.sleep(20)
+
+            except Exception as e:
+                log_print(f"[LIVE REAL ERROR] {e}")
+                time.sleep(5)
+
+
+# ------------------ Exchange Builder ------------------
+def build_exchange(cfg=CONFIG):
+    params = {
+        'enableRateLimit': True,
+        'options': {'defaultType': 'spot', 'fetchMarkets': True}
+    }
+    api_key = cfg.get('access_id') or os.environ.get('EXCHANGE_API_KEY')
+    secret = cfg.get('secret_key') or os.environ.get('EXCHANGE_SECRET')
+    if api_key and secret:
+        params['apiKey'] = api_key
+        params['secret'] = secret
+
+    ex_name = cfg.get('exchange', 'xt').lower()
+    if hasattr(ccxt, ex_name):
+        return getattr(ccxt, ex_name)(params)
+    else:
+        # fallback: try direct attribute, then construct xt
+        try:
+            return ccxt.xt(params)
+        except Exception:
+            return getattr(ccxt, ex_name)(params)
+
+# ------------------ Helpers / Entry ------------------
+def run_backtest():
+    exchange = build_exchange(CONFIG)
+    symbols = CONFIG.get('symbols_core', []) + CONFIG.get('symbols_extended', [])
+    bt = Backtester(exchange, symbols, CONFIG)
+    bt.run()
+    bt.export_logs()
+    log_print('Backtest finished.')
+
+def run_live_virtual():
+    exchange = build_exchange(CONFIG)
+    symbols = CONFIG.get('symbols_core', [])
+    lv = LiveVirtual(exchange, symbols, CONFIG)
+    lv.run_loop()
+
+def run_live_real():
+    exchange = build_exchange(CONFIG)
+    symbols = CONFIG.get('symbols_core', [])
+    lr = LiveReal(exchange, symbols, CONFIG)
+    lr.run_loop()
+
+def test_connection():
+    try:
+        exchange = build_exchange(CONFIG)
+        exchange.load_markets(reload=True)
+
+        symbols = CONFIG.get('symbols_core', [])
+        for symbol in symbols:
+            try:
+                ticker = exchange.fetch_ticker(symbol)
+                print(f"\n✅ Successful connection to xt exchange: Price {symbol}: {ticker.get('last')}")
+            except Exception as e:
+                print(f"\n⚠️ Warning: couldn't fetch ticker for {symbol}: {e}")
+
+    except Exception as e:
+        print(f"\n❌ خطای اتصال: {e}")
+
+if __name__ == '__main__':
+    ensure_dirs()
+    mode = CONFIG.get('mode', 'backtest')
+    log_print(f"[START] Mode: {mode}   --  Exchange: {CONFIG.get('exchange')}")
+    test_connection()
+    if mode == 'backtest':
+        run_backtest()
+    elif mode == 'live_virtual':
+        run_live_virtual()
+    elif mode == 'live_real':
+        run_live_real()
+    else:
+        log_print("[MAIN] Unknown mode in config.json. Set mode to backtest, live_virtual, or live_real.")
